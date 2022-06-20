@@ -1,0 +1,338 @@
+#!/bin/sh -e
+#L:
+#L:  MIT License
+#L:  
+#l:  Bug reports, feature requests to gemini|https://harkadev.com/oss
+#l:  Copyright (c) 2022 Harkaitz Agirre, harkaitz.aguirre@gmail.com
+#L:
+#L:  Permission is hereby granted, free of charge, to any person obtaining
+#L:  a copy of this software and associated documentation files (the
+#L:  "Software"), to deal in the Software without restriction, including
+#L:  without limitation the rights to use, copy, modify, merge, publish,
+#L:  distribute, sublicense, and/or sell copies of the Software, and to
+#L:  permit persons to whom the Software is furnished to do so, subject to
+#L:  the following conditions:
+#L:
+#L:  The above copyright notice and this permission notice shall be
+#L:  included in all copies or substantial portions of the Software.
+#L:
+#L:  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+#L:  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+#L:  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+#L:  NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+#L:  LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+#L:  OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+#L:  WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+##:
+#h: Usage: hq [-v][op]
+#h:
+#h: List machines and define operation menus for them. The scripts
+#h: are named MACHINE.sh and stored in ~/.hq or ${HQ_DIR}.
+#h:
+#h: Functions to define:
+#h:
+#h:     - HQ_current()      : Returns success in the machine.
+#h:     - HQ_ssh([CMD])     : Executes a command in the machine.
+#h:     - HQ_menu()         : Opens a menu in the machine.
+#h:     - HQ_menu_local()   : Open a menu locally.
+#h:     - HQ_restart_cron() : Restart cron.
+#h:
+#h: You can also define periodic tasks with the following comments.
+#h:
+#h:     #hcron[-local]: M H D M D F
+#h:     minute hour day-of-month month day-of-week function
+#h:
+#h:     *     : 0  6 *   * *   : At 6:00 every day
+#h:     30    : 30 5 *   * 1-5 : At 5:30 every business day.
+#h:     */N   : 0  5 */3 * *   : At 5:00 every third day of month.
+#h:     1-5   : 
+#h:     1,3,6 : 
+#h:
+#h: Operations:
+#h:
+#h:     ... show              : Show local configuration.
+#h:     ... ping              : Perform a ping on all machines.
+#h:     ... ssh-copy-all      : Copy SSH public keys to all machines.
+#h:     ... update-crontab    : Update the ~/.crontab-hq file.
+#h:     ... MACHINE [local]   : Execute the machine's menu remotelly.
+#h:     ... MACHINE exec FUNC : Execute a function remotelly.
+##:
+if test ! -n "${HPROFILE_VARS}" && test -e /etc/hprofile;then
+   . /etc/hprofile
+fi
+. hsh
+hq() {
+    local cmd="$1"
+    shift
+    case "${cmd}" in
+        help)
+            ## Print help head.
+            sed -n 's/^ *#h: \{0,1\}//p' "$0" | sed "s|\\\$0|${SCRNAME}|g"
+            ## Print machines.
+            echo ""
+            echo "Machines:"
+            echo ""
+            hq_list
+            ## Print licensing.
+            echo ""
+            sed -n 's/^ *#l: \{0,2\}//p' "$0"
+            ;;
+        show)
+            hq_show_variables
+            ;;
+        ping)
+            hq_ssh_ping_all
+            ;;
+        ssh-copy-all)
+            hq_ssh_copy_all
+            ;;
+        update-crontab)
+            hq_update_crontab
+            ;;
+        *)  if test @"${1}" = @"local"; then
+                shift
+                hq_menu_local "${cmd}" "$@"
+            elif test @"${1}" = @"exec"; then
+                shift
+                hq_exec "${cmd}" "$@"
+            elif test @"${1}" = @"exec-local"; then
+                shift
+                hq_exec_local "${cmd}" "$@"
+            else
+                hq_menu "${cmd}" "$@"
+            fi
+            ;;
+    esac
+}
+hq_show_variables() {
+    printf '%-20s : %s\n' HQ_DIR  "${HQ_DIR}"
+    printf '%-20s : %s\n' HQ_MAIL "${HQ_MAIL}"
+}
+## -----------------------------------------------------------------------------
+hq_list() {
+    local s= n=
+    for s in `hq_list_files`;do
+        local n="`basename "${s}" .sh`"
+        local h="`sed -n 's/^ *#h: \{0,1\}//p' "${s}" | head -n 1`"
+        printf -- '    - %-10s : %s\n' "${n}" "${h}"
+    done
+}
+hq_list_files() {
+    if test -d "${HQ_DIR}";then
+        find "${HQ_DIR}" -type f -iregex '.*\.sh$'
+    fi
+}
+hq_print_script_header() {
+    cat <<-EOF
+	#!/bin/bash -e
+	BASH_ARGV0="hq: \`basename "${1}" .sh\`"
+	HQ_HOSTNANE_SSH=''
+	HQ_HOSTNAME=''
+	HQ_current() {
+	    if test ! -n "\${HQ_HOSTNAME}";then
+	        echo "${1}: HQ_HOSTNAME or HQ_current() not defined." >&2
+	        return 1
+	    elif test @"\`uname -n\`" = @"\${HQ_HOSTNAME}";then
+	        return 0
+	    else
+	        return 1
+	    fi
+	}
+	HQ_ssh() {
+	    if test -n "\${HQ_HOSTNAME_SSH}";then
+	        ssh -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -q -t -- "\${HQ_HOSTNAME_SSH}" "
+	        set -e
+	        set -o errexit
+	        \$*"
+	    else
+	        echo "${1}: HQ_HOSTNAME_SSH or HQ_ssh() not defined." >&2
+	        return 1
+	    fi
+	}
+	HQ_ssh_copy() {
+	    if test ! -n "\${HQ_HOSTNAME_SSH}";then
+	        echo "${1}: HQ_HOSTNAME_SSH or HQ_ssh_copy() not defined." >&2
+	        return 1
+	    elif ssh -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -q -t -- "\${HQ_HOSTNAME_SSH}" true;then
+	        echo "Already installed."
+	    else 
+	        ssh-copy-id "\${HQ_HOSTNAME_SSH}"
+	    fi
+	}
+	HQ_menu() {
+	    echo "${1}: HQ_menu() not defined." >&2
+	    return 1
+	}
+	HQ_menu_local() {
+	    echo "${1}: HQ_menu_local() not defined." >&2
+	    return 1
+	}
+	HQ_restart_cron() {
+	    true
+	}
+	HQ_mail() {
+	    if true;then
+	        echo "To: ${HQ_MAIL}"
+	        echo "Subject: \${1:-HQ `basename $1 .sh`}"
+	        echo "Content-Type: text/html"
+	        echo ""
+	        tee /dev/stderr | pandoc -f markdown -t html
+	    fi | msmtp -t
+	}
+	HQ_verbatim() {
+	    echo
+	    "\$@" 2>&1 | sed 's|^|    |'
+	    echo
+	}
+	EOF
+}
+hq_execute_script_local() { # SCRIPT CODE
+    if test ! -n "${1}";then
+        echo "${1}: File does not exist." >&2
+        return 1
+    fi
+    local s="$1"; shift
+    local c="`hq_print_script_header "${s}"`"
+    bash -e -c "
+    ${c}
+    . '${s}'
+    $*
+    "
+}
+## -----------------------------------------------------------------------------
+hq_ssh_ping_all() {
+    local s=
+    for s in `hq_list_files`;do
+        printf "%-10s : " "`basename "${s}" .sh`"
+        hq_execute_script_local "${s}" "
+        if HQ_current;then
+            echo 'Host machine'
+        elif ! HQ_ssh echo 'SSH working';then
+            echo 'SSH not working'    
+        fi"
+    done
+}
+hq_ssh_copy_all() {
+    local s=
+    for s in `hq_list_files`;do
+        echo "== `basename "${s}" .sh`"
+        hq_execute_script_local "${s}" "
+        if HQ_current;then
+            echo 'Host machine'
+        else
+            HQ_ssh_copy || true
+        fi"
+    done
+}
+hq_update_crontab() {
+    local s= r="$0"
+    echo "${SCRNAME}: Generating ~/.crontab-hq"
+    for s in `hq_list_files`; do
+        local n="`basename "${s}" .sh`"
+        sed -n 's/^#cron: *//p' "${s}" | while read c1 c2 c3 c4 c5 cmd; do
+            printf '%-4s %-4s %-4s %-4s %-4s %s %-5s exec       %s\n' \
+                   "${c1}" "${c2}" "${c3}" "${c4}" "${c5}" "${r}" "${n}" "${cmd}"
+        done
+        sed -n 's/^#cron-local: *//p' "${s}" | while read c1 c2 c3 c4 c5 cmd; do
+            printf '%-4s %-4s %-4s %-4s %-4s %s %-5s exec-local %s\n' \
+                   "${c1}" "${c2}" "${c3}" "${c4}" "${c5}" "${r}" "${n}" "${cmd}"
+        done
+    done > ~/.crontab-hq
+    cat ~/.crontab-hq
+    local s="`hq_get_current_machines_script`"
+    test -n "${s}"
+    hq_execute_script_local "${s}" "
+    HQ_restart_cron
+    "
+}
+hq_get_current_machines_script() {
+    local s= n=
+    for s in `hq_list_files`; do
+        local n="`basename "${s}" .sh`"
+        hq_execute_script_local "${s}" "
+        if HQ_current '${n}';then
+            echo '${s}'
+        fi"
+    done
+}
+hq_menu() {
+    local n="${1}"
+    local s="${HQ_DIR}/${1}.sh"
+    if test ! -e "${s}";then
+        echo "${s}: File does not exist." >&2
+        return 1
+    fi
+    shift
+    local b="`hsh -o - "${s}"`"; test -n "${b}"
+    local h="`hq_print_script_header "${s}"`"
+    export HQ_CODE="
+    set -e
+    ${h}
+    ${b}
+    SCRNAME='${n}'
+    HQ_menu $*
+    "
+    hq_execute_script_local "${s}" "
+    if HQ_current;then
+        HQ_menu $*
+    else
+        HQ_ssh \"\${HQ_CODE}\"
+    fi"
+}
+hq_menu_local() {
+    local s="${HQ_DIR}/${1}.sh"
+    if test ! -e "${s}";then
+        echo "${s}: File does not exist." >&2
+        return 1
+    fi
+    shift
+    hq_execute_script_local "${s}" "
+    HQ_menu_local $*
+    "
+}
+hq_exec() {
+    local n="${1}"
+    local s="${HQ_DIR}/${1}.sh"
+    if test ! -e "${s}";then
+        echo "${s}: File does not exist." >&2
+        return 1
+    fi
+    shift
+    local b="`hsh -o - "${s}"`"; test -n "${b}"
+    local h="`hq_print_script_header "${s}"`"
+    export HQ_CODE="
+    set -e
+    ${h}
+    ${b}
+    SCRNAME='${n}'
+    $*
+    "
+    hq_execute_script_local "${s}" "
+    if HQ_current;then
+        $*
+    else
+        HQ_ssh \"\${HQ_CODE}\"
+    fi"
+}
+hq_exec_local() {
+    local s="${HQ_DIR}/${1}.sh"
+    if test ! -e "${s}";then
+        echo "${s}: File does not exist." >&2
+        return 1
+    fi
+    shift
+    hq_execute_script_local "${s}" "
+    $*
+    "
+}
+## -----------------------------------------------------------------------------
+HQ_DIR="${HQ_DIR:-${HOME}/.hq}"
+HQ_MAIL="${HQ_MAIL:-${EMAIL:-`whoami`}}"
+SCRNAME="`basename "$0"`"
+if test @"${SCRNAME}" = @"hq";then
+    case "${1}" in
+        -v)           hq show           ;;
+        -h|--help|'') hq help           ;;
+        *)            hq "$@"           ;;
+    esac
+fi
